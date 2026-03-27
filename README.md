@@ -20,15 +20,14 @@ PrepPilot AI offers both a Free plan and a Premium plan (**PrepPilot AI Pro**) w
 - Limited interview history
 
 ### 💎 Premium Plan – PrepPilot AI Pro
-- Unlimited mock interviews  
-- Advanced AI evaluation  
-- Resume-based personalized questions  
-- Company-specific interview sets  
-- Detailed rubric scoring  
-- Ideal answer comparison (Your vs AI)  
-- Downloadable PDF reports  
-- Priority faster AI processing  
-- Unlimited saved interview history  
+- Unlimited mock interviews
+- Advanced AI evaluation
+- Resume-based personalized questions
+- Company-specific interview sets
+- Detailed rubric scoring
+- Ideal answer comparison (Your Answer vs AI Answer)
+- Priority faster AI processing
+- Unlimited saved interview history
 
 ---
 
@@ -268,10 +267,11 @@ C:\Users\admin\project\ai-interviewer
 
 ## 📈 Future Improvements
 
-- Voice-based interview analysis
-- Multi-language AI feedback
-- Resume parsing system
-- Advanced analytics dashboard
+- Company-specific mock interviews
+- Resume-based personalized mock
+- Detailed rubric scoring
+- Ideal answer comparison
+- Downloadable PDF report
 
 # 👨‍💻 Author
 
