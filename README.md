@@ -185,9 +185,9 @@ PrepPilot AI includes a Premium upgrade system that unlocks:
 PrepPilot-AI/
 │
 ├── frontend/
-|	├── main.py
-|	├── requirements.txt
-|
+│	├── main.py
+│	├── requirements.txt
+│
 ├── frontend/
 │   ├── src/
 │   ├── public/
