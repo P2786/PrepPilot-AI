@@ -2,7 +2,7 @@
 import { useEffect } from "react";
 import { useSelector, useDispatch } from "react-redux";
 import { useParams, Link } from "react-router-dom";
-import { getSessionById } from "../features/sessions/sessionSlice";
+import { getProSessionById } from "../features/sessions/prosessionSlice";
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -69,10 +69,10 @@ function ProReview() {
 
   const { sessionId } = useParams();
   const dispatch = useDispatch();
-  const { activeSession, isLoading } = useSelector((state) => state.sessions);
+  const { activeProSession, isLoading } = useSelector((state) => state.proSessions);
 
   useEffect(() => {
-    dispatch(getSessionById(sessionId));
+    dispatch(getProSessionById(sessionId));
   }, [dispatch, sessionId]);
 
   // 🔥 GOLD LOADING
@@ -88,7 +88,7 @@ function ProReview() {
     );
   }
 
-  if (!activeSession || activeSession.status !== "completed") {
+  if (!activeProSession || activeProSession.status !== "completed") {
     return (
       <div className="min-h-screen bg-[#07040a] text-white flex items-center justify-center">
         <div className="text-center">
@@ -106,7 +106,7 @@ function ProReview() {
     );
   }
 
-  const { overallScore, metrics, role, level, questions } = activeSession;
+  const { overallScore, metrics, role, level, questions } = activeProSession;
 
   const barData = {
     labels: questions.map((_, i) => `Q${i + 1}`),
