@@ -27,22 +27,18 @@ import NotFound from "./pages/NotFound";
 const PublicOnlyRoute = ({ children }) => {
   const { user } = useSelector((state) => state.auth);
 
-  if (!user) {
-    return children;
-  }
+  if (!user) return children;
 
   const isProActive =
-    user.isPro &&
-    (!user.proExpiresAt || new Date(user.proExpiresAt) > new Date());
+    user?.isPro &&
+    (!user?.proExpiresAt || new Date(user.proExpiresAt) > new Date());
 
-  return (
-    <Navigate to={isProActive ? "/pro-dashboard" : "/dashboard"} replace />
-  );
+  return <Navigate to={isProActive ? "/pro-dashboard" : "/dashboard"} replace />;
 };
 
 const AppLayout = () => {
   const location = useLocation();
-  const isProRoute = location.pathname.startsWith("/pro");
+  const { user } = useSelector((state) => state.auth);
 
   const hideHeader =
     location.pathname === "/" ||
@@ -50,11 +46,18 @@ const AppLayout = () => {
     location.pathname === "/register" ||
     location.pathname === "/upgrade";
 
+  const isProActive =
+    user?.isPro &&
+    (!user?.proExpiresAt || new Date(user.proExpiresAt) > new Date());
 
+  const isProRoute = location.pathname.startsWith("/pro");
+
+  // ✅ Pro navbar only for actual active pro user on pro routes
+  const showProHeader = isProRoute && isProActive;
 
   return (
     <div className="min-h-screen bg-[#060816] text-white">
-      {!hideHeader && (isProRoute ? <ProHeader /> : <Header />)}
+      {!hideHeader && (showProHeader ? <ProHeader /> : <Header />)}
 
       <main className={hideHeader ? "" : "container mx-auto p-4"}>
         <Routes>
@@ -81,7 +84,6 @@ const AppLayout = () => {
           <Route path="/upgrade" element={<UpgradePage />} />
           <Route path="/payment" element={<PaymentPage />} />
 
-          {/* Normal user protected routes */}
           <Route element={<PrivateRoute />}>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/profile" element={<Profile />} />
@@ -89,7 +91,6 @@ const AppLayout = () => {
             <Route path="/review/:sessionId" element={<SessionReview />} />
           </Route>
 
-          {/* Pro user protected routes */}
           <Route element={<ProRoute />}>
             <Route path="/pro-dashboard" element={<ProDashboard />} />
             <Route path="/pro-profile" element={<ProProfile />} />
