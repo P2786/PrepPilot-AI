@@ -1,12 +1,10 @@
 # ai-service/requirements.txt
 fastapi
 uvicorn
-python-dotenv
 pydantic
-openai
-openai-whisper
-pydub
-python-multipart
-torch
-torchaudio
+python-dotenv
+ollama
+openai-whisper 
+pydub 
 ffmpeg-python
+python-multipart
