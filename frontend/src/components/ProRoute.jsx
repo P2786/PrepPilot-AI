@@ -10,11 +10,11 @@ const ProRoute = () => {
   }
 
   const isProActive =
-    user.isPro &&
-    (!user.proExpiresAt || new Date(user.proExpiresAt) > new Date());
+    user?.isPro &&
+    (!user?.proExpiresAt || new Date(user.proExpiresAt) > new Date());
 
   if (!isProActive) {
-    return <Navigate to="/upgrade" replace />;
+    return <Navigate to="/dashboard" replace />;
   }
 
   return <Outlet />;
