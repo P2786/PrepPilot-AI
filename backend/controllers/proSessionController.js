@@ -1,14 +1,19 @@
 import asyncHandler from "express-async-handler";
 import ProSession from "../models/ProSession.js";
 import User from "../models/User.js";
-import fetch from "node-fetch";
 import fs from "fs";
-import FormData from "form-data";
 import path from "path";
 import mongoose from "mongoose";
+import OpenAI from "openai";
 import { refreshWeeklyInterviewWindow, isProActive } from "../utils/proAccess.js";
 
-const AI_SERVICE_URL = "http://localhost:8000";
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const OPENAI_TEXT_MODEL = process.env.OPENAI_TEXT_MODEL || "gpt-4.1-mini";
+const OPENAI_TRANSCRIBE_MODEL =
+  process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
 
 const pushSocketUpdate = (io, userId, sessionId, status, message, session = null) => {
   io.to(userId.toString()).emit("proSessionUpdate", {
@@ -17,6 +22,152 @@ const pushSocketUpdate = (io, userId, sessionId, status, message, session = null
     message,
     session,
   });
+};
+
+const safeJsonParse = (text, fallbackMessage = "Invalid JSON from OpenAI") => {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    console.error("JSON parse failed. Raw OpenAI output:", text);
+    throw new Error(fallbackMessage);
+  }
+};
+
+const buildQuestionsPrompt = ({ role, level, count, interviewType }) => `
+Generate exactly ${count} interview questions for a ${level} ${role} candidate.
+
+Interview type: ${interviewType}
+
+Rules:
+- Return ONLY valid JSON.
+- Do not include markdown.
+- Do not include explanation.
+- Output format must be:
+{
+  "questions": [
+    {
+      "questionText": "question here",
+      "questionType": "oral"
+    }
+  ]
+}
+- questionType must be either "oral" or "coding".
+- If interview type is "oral-only", all questions must be "oral".
+- If interview type is "coding-mix", include around 20% "coding" questions and the rest "oral".
+- Questions must be realistic, technical, concise, and suitable for interview practice.
+- No duplicate questions.
+`;
+
+const buildEvaluationPrompt = ({
+  question,
+  questionType,
+  role,
+  level,
+  userAnswer,
+  userCode,
+}) => `
+You are an expert technical interviewer.
+
+Evaluate the candidate's answer for the following interview question.
+
+Role: ${role}
+Level: ${level}
+Question Type: ${questionType}
+Question: ${question}
+
+Candidate theory answer:
+${userAnswer || "(No theory answer provided)"}
+
+Candidate code answer:
+${userCode || "(No code provided)"}
+
+Return ONLY valid JSON in this exact format:
+{
+  "technicalScore": 0,
+  "confidenceScore": 0,
+  "aiFeedback": "string",
+  "idealAnswer": "string"
+}
+
+Rules:
+- technicalScore must be an integer from 0 to 100.
+- confidenceScore must be an integer from 0 to 100.
+- aiFeedback should be detailed but readable, around 4 to 8 sentences.
+- idealAnswer should be a strong model answer for this question.
+- No markdown.
+- No explanation outside JSON.
+`;
+
+const generateQuestionsWithOpenAI = async ({ role, level, count, interviewType }) => {
+  const response = await openai.responses.create({
+    model: OPENAI_TEXT_MODEL,
+    input: buildQuestionsPrompt({ role, level, count, interviewType }),
+  });
+
+  const outputText = response.output_text?.trim();
+
+  if (!outputText) {
+    throw new Error("Empty question generation response from OpenAI");
+  }
+
+  const parsed = safeJsonParse(outputText, "Failed to parse generated questions");
+  const questions = Array.isArray(parsed.questions) ? parsed.questions : [];
+
+  if (!questions.length) {
+    throw new Error("No questions returned by OpenAI");
+  }
+
+  return questions.map((item) => ({
+    questionText: String(item.questionText || "").trim(),
+    questionType: item.questionType === "coding" ? "coding" : "oral",
+    isEvaluated: false,
+    isSubmitted: false,
+  }));
+};
+
+const evaluateAnswerWithOpenAI = async ({
+  question,
+  questionType,
+  role,
+  level,
+  userAnswer,
+  userCode,
+}) => {
+  const response = await openai.responses.create({
+    model: OPENAI_TEXT_MODEL,
+    input: buildEvaluationPrompt({
+      question,
+      questionType,
+      role,
+      level,
+      userAnswer,
+      userCode,
+    }),
+  });
+
+  const outputText = response.output_text?.trim();
+
+  if (!outputText) {
+    throw new Error("Empty evaluation response from OpenAI");
+  }
+
+  const parsed = safeJsonParse(outputText, "Failed to parse evaluation result");
+
+  return {
+    technicalScore: Math.max(0, Math.min(100, Number(parsed.technicalScore) || 0)),
+    confidenceScore: Math.max(0, Math.min(100, Number(parsed.confidenceScore) || 0)),
+    aiFeedback: String(parsed.aiFeedback || "No feedback generated."),
+    idealAnswer: String(parsed.idealAnswer || "No ideal answer generated."),
+  };
+};
+
+const transcribeAudioWithOpenAI = async (audioFilePath) => {
+  const transcription = await openai.audio.transcriptions.create({
+    file: fs.createReadStream(audioFilePath),
+    model: OPENAI_TRANSCRIBE_MODEL,
+  });
+
+  return transcription?.text || "";
 };
 
 // @desc    Create a new pro interview session and start AI question generation
@@ -31,7 +182,13 @@ const createProSession = asyncHandler(async (req, res) => {
     throw new Error("Please specify role, level, interview type, and question count.");
   }
 
-  // 🔥 Get current user for free/pro limit check
+  const numericCount = Number(count);
+
+  if (!Number.isInteger(numericCount) || numericCount <= 0) {
+    res.status(400);
+    throw new Error("Question count must be a valid positive number.");
+  }
+
   const user = await User.findById(userId);
 
   if (!user) {
@@ -39,12 +196,10 @@ const createProSession = asyncHandler(async (req, res) => {
     throw new Error("User not found");
   }
 
-  // Reset weekly window if 7 days passed
   refreshWeeklyInterviewWindow(user);
 
   const proActive = isProActive(user);
 
-  // Free users: only 2 interviews per week
   if (!proActive && user.weeklyInterviewCount >= 2) {
     await user.save();
     res.status(403);
@@ -59,7 +214,6 @@ const createProSession = asyncHandler(async (req, res) => {
     status: "pending",
   });
 
-  // Increase count only for free users after successful session creation
   if (!proActive) {
     user.weeklyInterviewCount += 1;
     await user.save();
@@ -80,34 +234,15 @@ const createProSession = asyncHandler(async (req, res) => {
         userId,
         session._id,
         "AI_GENERATING_QUESTIONS",
-        `Generating ${count} questions for ${role}...`
+        `Generating ${numericCount} questions for ${role}...`
       );
 
-      const aiResponse = await fetch(`${AI_SERVICE_URL}/generate-questions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          role,
-          level,
-          count,
-          interview_type: interviewType,
-        }),
+      const questionsArray = await generateQuestionsWithOpenAI({
+        role,
+        level,
+        count: numericCount,
+        interviewType,
       });
-
-      if (!aiResponse.ok) {
-        const errorBody = await aiResponse.text();
-        throw new Error(`AI Service error: ${aiResponse.status} - ${errorBody}`);
-      }
-
-      const aiData = await aiResponse.json();
-      const codingCount = interviewType === "coding-mix" ? Math.floor(count * 0.2) : 0;
-
-      const questionsArray = aiData.questions.map((qText, index) => ({
-        questionText: qText,
-        questionType: index < codingCount ? "coding" : "oral",
-        isEvaluated: false,
-        isSubmitted: false,
-      }));
 
       session.questions = questionsArray;
       session.status = "in-progress";
@@ -147,7 +282,10 @@ const getProSessions = asyncHandler(async (req, res) => {
 });
 
 const getProSessionById = asyncHandler(async (req, res) => {
-  const session = await ProSession.findOne({ _id: req.params.id, user: req.user._id });
+  const session = await ProSession.findOne({
+    _id: req.params.id,
+    user: req.user._id,
+  });
 
   if (session) {
     res.json(session);
@@ -190,12 +328,14 @@ const evaluateProAnswerAsync = async (
     typeof questionIndex === "string" ? parseInt(questionIndex, 10) : questionIndex;
 
   const session = await ProSession.findById(sessionId);
+
   if (!session) {
     console.error(`Session ${sessionId} not found`);
     return;
   }
 
   const question = session.questions[questionIdx];
+
   if (!question) {
     pushSocketUpdate(
       io,
@@ -208,7 +348,6 @@ const evaluateProAnswerAsync = async (
     return;
   }
 
-  // Only transcribe if actual audio exists
   if (audioFilePath) {
     try {
       pushSocketUpdate(
@@ -219,23 +358,14 @@ const evaluateProAnswerAsync = async (
         `Transcribing audio for Q${questionIdx + 1}...`
       );
 
-      const formData = new FormData();
-      formData.append("file", fs.createReadStream(audioFilePath));
-
-      const transResponse = await fetch(`${AI_SERVICE_URL}/transcribe`, {
-        method: "POST",
-        body: formData,
-        headers: formData.getHeaders(),
-      });
-
-      if (!transResponse.ok) throw new Error("Transcription service failed");
-
-      const transData = await transResponse.json();
-      transcription = transData.transcription || transcription || "";
+      const transcriptText = await transcribeAudioWithOpenAI(audioFilePath);
+      transcription = transcriptText || transcription || "";
     } catch (error) {
       console.error(`Transcription Error: ${error.message}`);
     } finally {
-      if (audioFilePath && fs.existsSync(audioFilePath)) fs.unlinkSync(audioFilePath);
+      if (audioFilePath && fs.existsSync(audioFilePath)) {
+        fs.unlinkSync(audioFilePath);
+      }
     }
   }
 
@@ -248,22 +378,14 @@ const evaluateProAnswerAsync = async (
       `AI is analyzing Q${questionIdx + 1}...`
     );
 
-    const evalResponse = await fetch(`${AI_SERVICE_URL}/evaluate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question: question.questionText,
-        question_type: question.questionType,
-        role: session.role,
-        level: session.level,
-        user_answer: transcription,
-        user_code: code || "",
-      }),
+    const evalData = await evaluateAnswerWithOpenAI({
+      question: question.questionText,
+      questionType: question.questionType,
+      role: session.role,
+      level: session.level,
+      userAnswer: transcription,
+      userCode: code || "",
     });
-
-    if (!evalResponse.ok) throw new Error("AI Evaluation service failed");
-
-    const evalData = await evalResponse.json();
 
     question.userAnswerText = transcription || "";
     question.userSubmittedCode = code || "";
@@ -301,6 +423,7 @@ const evaluateProAnswerAsync = async (
       );
     } else {
       await session.save();
+
       pushSocketUpdate(
         io,
         userId,
@@ -312,7 +435,7 @@ const evaluateProAnswerAsync = async (
     }
   } catch (error) {
     console.error(`Evaluation Error: ${error.message}`);
-    pushSocketUpdate(io, userId, sessionId, "EVALUATION_FAILED", `Evaluation failed.`, session);
+    pushSocketUpdate(io, userId, sessionId, "EVALUATION_FAILED", "Evaluation failed.", session);
   }
 };
 
@@ -417,6 +540,7 @@ const endProSession = asyncHandler(async (req, res) => {
   }
 
   const isProcessing = session.questions.some((q) => q.isSubmitted && !q.isEvaluated);
+
   if (isProcessing) {
     res.status(400);
     throw new Error("Cannot end interview while AI is processing answers.");
@@ -440,7 +564,14 @@ const endProSession = asyncHandler(async (req, res) => {
   await session.save();
 
   const io = req.app.get("io");
-  pushSocketUpdate(io, userId, sessionId, "SESSION_COMPLETED", "Interview session ended early.", session);
+  pushSocketUpdate(
+    io,
+    userId,
+    sessionId,
+    "SESSION_COMPLETED",
+    "Interview session ended early.",
+    session
+  );
 
   res.json({ message: "Session ended successfully.", session });
 });
