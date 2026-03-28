@@ -10,10 +10,6 @@ import { notFound, errorHandler } from "./middleware/errorMiddleware.js";
 import proSessionRoutes from "./routes/proSessionRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 
-
-
-
-
 dotenv.config();
 
 connectDB();
@@ -24,7 +20,9 @@ const server = http.createServer(app);
 const allowedOrigins = [
   "http://localhost:5174",
   "http://localhost:5173",
-];
+  "https://preppilot-ai-interview.vercel.app",
+  process.env.CLIENT_URL,
+].filter(Boolean);
 
 const io = new Server(server, {
   cors: {
@@ -37,7 +35,15 @@ const io = new Server(server, {
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
@@ -55,10 +61,8 @@ app.get("/", (req, res) => {
 
 app.use("/api/users", userRoutes);
 app.use("/api/sessions", sessionRoutes);
-
 app.use("/api/pro-sessions", proSessionRoutes);
 app.use("/api/payments", paymentRoutes);
-
 
 io.on("connection", (socket) => {
   console.log(`A user connected: ${socket.id}`);
