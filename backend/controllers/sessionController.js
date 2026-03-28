@@ -8,7 +8,7 @@ import path from "path";
 import mongoose from "mongoose";
 import { refreshWeeklyInterviewWindow, isProActive } from "../utils/proAccess.js";
 
-const AI_SERVICE_URL = "http://localhost:8000";
+const AI_SERVICE_URL = "https://preppilot-ai-service.onrender.com";
 
 const pushSocketUpdate = (io, userId, sessionId, status, message, session = null) => {
   io.to(userId.toString()).emit("sessionUpdate", {
