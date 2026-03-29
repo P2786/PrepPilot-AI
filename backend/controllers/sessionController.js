@@ -8,7 +8,12 @@ import path from "path";
 import mongoose from "mongoose";
 import { refreshWeeklyInterviewWindow, isProActive } from "../utils/proAccess.js";
 
-const AI_SERVICE_URL = "https://preppilot-ai-service.onrender.com";
+const AI_SERVICE_URL =
+  process.env.AI_SERVICE_URL || "https://preppilot-ai-service.onrender.com";
+
+const generationLocks = new Map();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const pushSocketUpdate = (io, userId, sessionId, status, message, session = null) => {
   io.to(userId.toString()).emit("sessionUpdate", {
@@ -19,19 +24,77 @@ const pushSocketUpdate = (io, userId, sessionId, status, message, session = null
   });
 };
 
+const getErrorText = async (response) => {
+  try {
+    return await response.text();
+  } catch {
+    return "Unknown AI service error";
+  }
+};
+
+const isRetryableStatus = (status) => [429, 500, 502, 503, 504].includes(status);
+
+const fetchWithRetry = async (url, options, retries = 3, baseDelay = 2000) => {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+
+      if (!response.ok) {
+        const errorBody = await getErrorText(response);
+        const error = new Error(
+          `AI Service error: ${response.status} - ${errorBody}`
+        );
+        error.status = response.status;
+
+        if (attempt < retries && isRetryableStatus(response.status)) {
+          const delay = Math.min(baseDelay * Math.pow(2, attempt), 10000);
+          await sleep(delay);
+          continue;
+        }
+
+        throw error;
+      }
+
+      return response;
+    } catch (error) {
+      lastError = error;
+
+      const retryable =
+        error?.status && isRetryableStatus(error.status);
+
+      if (attempt < retries && retryable) {
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), 10000);
+        await sleep(delay);
+        continue;
+      }
+
+      throw lastError;
+    }
+  }
+
+  throw lastError;
+};
+
 // @desc    Create a new interview session and start AI question generation
 // @route   POST /api/sessions/
 // @access  Private
 const createSession = asyncHandler(async (req, res) => {
   const { role, level, interviewType, count } = req.body;
   const userId = req.user._id;
+  const userIdStr = userId.toString();
 
   if (!role || !level || !interviewType || !count) {
     res.status(400);
     throw new Error("Please specify role, level, interview type, and question count.");
   }
 
-  // 🔥 Get current user for free/pro limit check
+  if (generationLocks.get(userIdStr)) {
+    res.status(429);
+    throw new Error("An interview is already being generated. Please wait a few seconds.");
+  }
+
   const user = await User.findById(userId);
 
   if (!user) {
@@ -39,12 +102,10 @@ const createSession = asyncHandler(async (req, res) => {
     throw new Error("User not found");
   }
 
-  // Reset weekly window if 7 days passed
   refreshWeeklyInterviewWindow(user);
 
   const proActive = isProActive(user);
 
-  // Free users: only 2 interviews per week
   if (!proActive && user.weeklyInterviewCount >= 2) {
     await user.save();
     res.status(403);
@@ -59,7 +120,6 @@ const createSession = asyncHandler(async (req, res) => {
     status: "pending",
   });
 
-  // Increase count only for free users after successful session creation
   if (!proActive) {
     user.weeklyInterviewCount += 1;
     await user.save();
@@ -73,6 +133,8 @@ const createSession = asyncHandler(async (req, res) => {
     status: "processing",
   });
 
+  generationLocks.set(userIdStr, true);
+
   (async () => {
     try {
       pushSocketUpdate(
@@ -83,26 +145,27 @@ const createSession = asyncHandler(async (req, res) => {
         `Generating ${count} questions for ${role}...`
       );
 
-      const aiResponse = await fetch(`${AI_SERVICE_URL}/generate-questions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          role,
-          level,
-          count,
-          interview_type: interviewType,
-        }),
-      });
-
-      if (!aiResponse.ok) {
-        const errorBody = await aiResponse.text();
-        throw new Error(`AI Service error: ${aiResponse.status} - ${errorBody}`);
-      }
+      const aiResponse = await fetchWithRetry(
+        `${AI_SERVICE_URL}/generate-questions`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            role,
+            level,
+            count,
+            interview_type: interviewType,
+          }),
+        },
+        3,
+        2000
+      );
 
       const aiData = await aiResponse.json();
-      const codingCount = interviewType === "coding-mix" ? Math.floor(count * 0.2) : 0;
+      const codingCount =
+        interviewType === "coding-mix" ? Math.floor(count * 0.2) : 0;
 
-      const questionsArray = aiData.questions.map((qText, index) => ({
+      const questionsArray = (aiData.questions || []).map((qText, index) => ({
         questionText: qText,
         questionType: index < codingCount ? "coding" : "oral",
         isEvaluated: false,
@@ -127,13 +190,22 @@ const createSession = asyncHandler(async (req, res) => {
       session.status = "failed";
       await session.save();
 
+      let friendlyMessage = `Question generation failed. Reason: ${error.message}.`;
+
+      if (error.message.includes("429")) {
+        friendlyMessage =
+          "Question generation failed. AI service is busy right now. Please wait a few seconds and try again.";
+      }
+
       pushSocketUpdate(
         io,
         userId,
         session._id,
         "GENERATION_FAILED",
-        `Question generation failed. Reason: ${error.message}.`
+        friendlyMessage
       );
+    } finally {
+      generationLocks.delete(userIdStr);
     }
   })();
 });
@@ -208,7 +280,6 @@ const evaluateAnswerAsync = async (
     return;
   }
 
-  // Only transcribe if actual audio exists
   if (audioFilePath) {
     try {
       pushSocketUpdate(
@@ -222,20 +293,25 @@ const evaluateAnswerAsync = async (
       const formData = new FormData();
       formData.append("file", fs.createReadStream(audioFilePath));
 
-      const transResponse = await fetch(`${AI_SERVICE_URL}/transcribe`, {
-        method: "POST",
-        body: formData,
-        headers: formData.getHeaders(),
-      });
-
-      if (!transResponse.ok) throw new Error("Transcription service failed");
+      const transResponse = await fetchWithRetry(
+        `${AI_SERVICE_URL}/transcribe`,
+        {
+          method: "POST",
+          body: formData,
+          headers: formData.getHeaders(),
+        },
+        2,
+        1500
+      );
 
       const transData = await transResponse.json();
       transcription = transData.transcription || transcription || "";
     } catch (error) {
       console.error(`Transcription Error: ${error.message}`);
     } finally {
-      if (audioFilePath && fs.existsSync(audioFilePath)) fs.unlinkSync(audioFilePath);
+      if (audioFilePath && fs.existsSync(audioFilePath)) {
+        fs.unlinkSync(audioFilePath);
+      }
     }
   }
 
@@ -248,20 +324,23 @@ const evaluateAnswerAsync = async (
       `AI is analyzing Q${questionIdx + 1}...`
     );
 
-    const evalResponse = await fetch(`${AI_SERVICE_URL}/evaluate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question: question.questionText,
-        question_type: question.questionType,
-        role: session.role,
-        level: session.level,
-        user_answer: transcription,
-        user_code: code || "",
-      }),
-    });
-
-    if (!evalResponse.ok) throw new Error("AI Evaluation service failed");
+    const evalResponse = await fetchWithRetry(
+      `${AI_SERVICE_URL}/evaluate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: question.questionText,
+          question_type: question.questionType,
+          role: session.role,
+          level: session.level,
+          user_answer: transcription,
+          user_code: code || "",
+        }),
+      },
+      2,
+      1500
+    );
 
     const evalData = await evalResponse.json();
 
@@ -312,7 +391,14 @@ const evaluateAnswerAsync = async (
     }
   } catch (error) {
     console.error(`Evaluation Error: ${error.message}`);
-    pushSocketUpdate(io, userId, sessionId, "EVALUATION_FAILED", `Evaluation failed.`, session);
+    pushSocketUpdate(
+      io,
+      userId,
+      sessionId,
+      "EVALUATION_FAILED",
+      "Evaluation failed. Please try again.",
+      session
+    );
   }
 };
 
@@ -440,7 +526,14 @@ const endSession = asyncHandler(async (req, res) => {
   await session.save();
 
   const io = req.app.get("io");
-  pushSocketUpdate(io, userId, sessionId, "SESSION_COMPLETED", "Interview session ended early.", session);
+  pushSocketUpdate(
+    io,
+    userId,
+    sessionId,
+    "SESSION_COMPLETED",
+    "Interview session ended early.",
+    session
+  );
 
   res.json({ message: "Session ended successfully.", session });
 });
